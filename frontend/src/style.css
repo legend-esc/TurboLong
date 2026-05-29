@@ -575,6 +575,25 @@ main { flex: 1; max-width: 1200px; width: 100%; margin: 0 auto; padding: 20px 24
 .pos-event-hf { color: var(--text-3); font-size: 11px; font-family: var(--mono); }
 .pos-event-link { color: var(--primary); font-size: 11px; font-family: var(--mono); white-space: nowrap; }
 
+/* ── Worst-case scenario panel (B14) ─────────────────────────────────────── */
+
+.worst-case-panel { margin-top: 10px; }
+.worst-case-summary {
+  font-size: 12px; color: var(--text-3); cursor: pointer; user-select: none;
+  list-style: none; font-weight: 600;
+}
+.worst-case-summary::-webkit-details-marker { display: none; }
+.worst-case-body { margin-top: 8px; font-size: 12px; }
+.wc-premise { color: var(--text-3); margin: 0 0 8px; line-height: 1.5; }
+.wc-premise strong { color: var(--text-2); }
+.wc-rows { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.wc-row { display: flex; align-items: center; gap: 8px; }
+.wc-days { color: var(--text-3); font-family: var(--mono); width: 28px; }
+.wc-arrow { color: var(--text-3); }
+.wc-hf { font-weight: 600; font-family: var(--mono); }
+.wc-liq { color: var(--text-3); margin: 0; }
+.wc-na { color: var(--text-3); font-size: 12px; }
+
 /* ── Open form ───────────────────────────────────────────────────────────── */
 
 .form-group { margin-bottom: 16px; }

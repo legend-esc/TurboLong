@@ -1258,6 +1258,73 @@ function switchAdjustSubTab(sub: "leverage" | "add-funds") {
   updatePreview();
 }
 
+// ── Worst-case scenario panel (B14) ──────────────────────────────────────────
+
+/**
+ * Compute borrow APR at a given utilization using the real IR curve parameters.
+ * Mirrors the exact formula in blend.ts / fetchAllReserves.
+ */
+function irAtUtil(util: number, rc: { rBase: number; rOne: number; rTwo: number; rThree: number; utilOpt: number; irMod: number }): number {
+  const SCALAR_F  = 10_000_000;
+  const FIXED_95  = 9_500_000;
+  const utilFp    = Math.round(util * SCALAR_F);
+  const { rBase, rOne, rTwo, rThree, utilOpt, irMod } = rc;
+  let base: number;
+  if (utilFp <= utilOpt) {
+    base = rBase + Math.ceil(rOne * utilFp / utilOpt);
+  } else if (utilFp <= FIXED_95) {
+    const slope = Math.ceil((utilFp - utilOpt) * SCALAR_F / (FIXED_95 - utilOpt));
+    base = rBase + rOne + Math.ceil(rTwo * slope / SCALAR_F);
+  } else {
+    const slope = Math.ceil((utilFp - FIXED_95) * SCALAR_F / (SCALAR_F - FIXED_95));
+    base = rBase + rOne + rTwo + Math.ceil(rThree * slope / SCALAR_F);
+  }
+  return (Math.ceil(base * irMod / SCALAR_F) / SCALAR_F) * 100; // → APR %
+}
+
+function renderWorstCase(lev: number, hf: number, rs: ReserveStats | null) {
+  const body = document.getElementById("worst-case-body");
+  if (!body) return;
+
+  if (!rs || !isFinite(hf) || hf <= 1 || lev <= 1) {
+    body.innerHTML = `<span class="wc-na">Open a position to see worst-case projection.</span>`;
+    return;
+  }
+
+  const rc = rs.rateConfig;
+  const BACKSTOP = rc.backstopFP / 10_000_000;
+
+  // Worst-case: r_three kicks in at 99% util
+  const UTIL_WORST = 0.99;
+  const borrowApr  = irAtUtil(UTIL_WORST, rc);
+  const supplyApr  = borrowApr * UTIL_WORST * (1 - BACKSTOP);
+  const spread     = borrowApr - supplyApr; // %/yr
+
+  // HF(t) = HF(0) × e^(−spread/100 × t/365)  where t is days
+  const scenarios = [30, 90, 180];
+  const rows = scenarios.map(days => {
+    const hfFuture = hf * Math.exp(-(spread / 100) * (days / 365));
+    const cls = hfFuture > 1.1 ? "hf-ok" : hfFuture > 1.03 ? "hf-warn" : "hf-bad";
+    return `<div class="wc-row">
+      <span class="wc-days">${days}d</span>
+      <span class="wc-arrow">→</span>
+      <span class="wc-hf ${cls}">HF ${fmt(hfFuture, 3)}</span>
+    </div>`;
+  }).join("");
+
+  // Days until HF = 1.0 at worst-case spread
+  const daysToLiq = spread > 0 ? Math.log(hf) / (spread / 100) * 365 : Infinity;
+  const daysStr   = daysToLiq > 3650 ? ">10 years" : `~${Math.round(daysToLiq)} days`;
+  const daysClass = daysToLiq < 30 ? "hf-bad" : daysToLiq < 90 ? "hf-warn" : "hf-ok";
+
+  body.innerHTML = `
+    <p class="wc-premise">If r_three kicks in and util stays at 99%:<br>
+      borrow ${fmt(borrowApr, 2)}%/yr · supply ${fmt(supplyApr, 2)}%/yr · spread <strong>${fmt(spread, 2)}%/yr</strong>
+    </p>
+    <div class="wc-rows">${rows}</div>
+    <p class="wc-liq">Liquidation in <span class="${daysClass}">${daysStr}</span> at this spread.</p>`;
+}
+
 // ── Leverage preview ──────────────────────────────────────────────────────────
 
 function updatePreview() {
@@ -1397,6 +1464,9 @@ function updatePreview() {
       ? `Add ${fmt(addAmt, 2)} ${selectedAsset.symbol} at ${lev.toFixed(1)}\u00D7`
       : "Add Funds";
   }
+
+  // Worst-case scenario panel (B14)
+  renderWorstCase(lev, hf, rs ?? null);
 }
 
 // ── Load data ─────────────────────────────────────────────────────────────────
