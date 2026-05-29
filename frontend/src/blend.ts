@@ -1340,3 +1340,68 @@ export async function submitClassicXdr(signedXdr: string): Promise<string> {
   const result = await horizon.submitTransaction(tx);
   return (result as any).hash;
 }
+
+// ── Position event timeline (A25) ─────────────────────────────────────────────
+
+export type PositionEventKind = "open" | "rebalance" | "harvest" | "close";
+
+export interface PositionEvent {
+  kind:      PositionEventKind;
+  hash:      string;
+  timestamp: number; // ms since epoch
+  hf:        number | null;
+}
+
+/**
+ * Fetch on-chain events for a user's position in a pool by scanning Horizon
+ * payment/invoke operations on the pool contract account.
+ *
+ * Horizon's /accounts/{pool}/operations endpoint returns all operations that
+ * touched the pool contract. We filter by the user's source account and map
+ * the operation type / function name to a PositionEventKind.
+ */
+export async function fetchPositionEvents(
+  pool: PoolDef,
+  userAddress: string,
+  assetId: string,
+): Promise<PositionEvent[]> {
+  const events: PositionEvent[] = [];
+  // Horizon returns up to 200 records per page; one page is enough for a timeline.
+  const url = `${_cfg.horizonUrl}/accounts/${pool.id}/operations?limit=200&order=desc&include_failed=false`;
+  let resp: any;
+  try {
+    resp = await (await fetch(url)).json();
+  } catch {
+    return events;
+  }
+  const records: any[] = resp?._embedded?.records ?? [];
+  for (const op of records) {
+    // Only care about invoke_host_function ops from this user
+    if (op.type !== "invoke_host_function") continue;
+    if (op.source_account !== userAddress) continue;
+
+    const fn: string = op.function ?? "";
+    let kind: PositionEventKind | null = null;
+    if (fn === "submit") {
+      // Distinguish open vs close vs rebalance by checking asset involvement.
+      // We use the presence of the assetId in the parameters as a heuristic.
+      const params: string = JSON.stringify(op.parameters ?? []);
+      if (params.includes(assetId)) {
+        // Heuristic: if the ledger_key_hash list is short it's likely an open/close;
+        // we fall back to "rebalance" for all submit calls on existing positions.
+        kind = "rebalance";
+      }
+    } else if (fn === "claim") {
+      kind = "harvest";
+    }
+    if (!kind) continue;
+
+    events.push({
+      kind,
+      hash:      op.transaction_hash,
+      timestamp: new Date(op.created_at).getTime(),
+      hf:        null, // HF snapshot injected by main.ts at record time
+    });
+  }
+  return events;
+}

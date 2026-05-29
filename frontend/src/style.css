@@ -554,6 +554,27 @@ main { flex: 1; max-width: 1200px; width: 100%; margin: 0 auto; padding: 20px 24
 .tx-history-status-ok { color: var(--success); }
 .tx-history-status-err { color: var(--danger); }
 
+/* ── Position event timeline (A25) ──────────────────────────────────────── */
+
+.pos-timeline { margin-top: 14px; border-top: 1px solid var(--border); padding-top: 10px; }
+.pos-timeline-list { max-height: 240px; overflow-y: auto; margin-top: 8px; }
+.pos-event-item {
+  display: grid;
+  grid-template-columns: 18px 70px 1fr auto auto;
+  align-items: center; gap: 6px;
+  padding: 6px 0; font-size: 12px; border-bottom: 1px solid var(--border);
+}
+.pos-event-item:last-child { border-bottom: none; }
+.pos-event-icon { font-size: 13px; text-align: center; }
+.pos-event-open    .pos-event-icon { color: var(--success); }
+.pos-event-close   .pos-event-icon { color: var(--danger); }
+.pos-event-rebalance .pos-event-icon { color: var(--primary); }
+.pos-event-harvest .pos-event-icon { color: var(--warning); }
+.pos-event-label { font-weight: 600; color: var(--text-2); }
+.pos-event-time { color: var(--text-3); font-family: var(--mono); font-size: 11px; cursor: help; }
+.pos-event-hf { color: var(--text-3); font-size: 11px; font-family: var(--mono); }
+.pos-event-link { color: var(--primary); font-size: 11px; font-family: var(--mono); white-space: nowrap; }
+
 /* ── Open form ───────────────────────────────────────────────────────────── */
 
 .form-group { margin-bottom: 16px; }

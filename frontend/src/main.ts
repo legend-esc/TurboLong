@@ -51,6 +51,9 @@ import {
   type AssetPosition,
   type UserPositions,
   projectRates,
+  fetchPositionEvents,
+  type PositionEvent,
+  type PositionEventKind,
 } from "./blend.ts";
 
 import {
@@ -445,6 +448,94 @@ function renderTxHistory() {
       <a class="tx-history-link" href="https://stellar.expert/explorer/public/tx/${tx.hash}" target="_blank" rel="noopener">View</a>
     </div>`;
   }).join("");
+}
+
+// ── Position event timeline (A25) ─────────────────────────────────────────────
+
+const POS_EVENTS_MAX = 50;
+
+function posEventsKey(assetId: string, poolId: string) {
+  return `pos_events_${poolId}_${assetId}`;
+}
+
+function getPositionEvents(assetId: string, poolId: string): PositionEvent[] {
+  const raw = localStorage.getItem(posEventsKey(assetId, poolId));
+  return raw ? JSON.parse(raw) : [];
+}
+
+function savePositionEvents(assetId: string, poolId: string, events: PositionEvent[]) {
+  localStorage.setItem(posEventsKey(assetId, poolId), JSON.stringify(events.slice(0, POS_EVENTS_MAX)));
+}
+
+function recordPositionEvent(kind: PositionEventKind, hash: string, hf: number | null) {
+  const events = getPositionEvents(selectedAsset.id, selectedPool.id);
+  // Deduplicate by hash
+  if (events.some(e => e.hash === hash)) return;
+  events.unshift({ kind, hash, timestamp: Date.now(), hf });
+  savePositionEvents(selectedAsset.id, selectedPool.id, events);
+}
+
+function explorerTxUrl(hash: string): string {
+  const net = getActiveNetwork() === "testnet" ? "testnet" : "public";
+  return `https://stellar.expert/explorer/${net}/tx/${hash}`;
+}
+
+const EVENT_LABELS: Record<PositionEventKind, string> = {
+  open:      "Open",
+  rebalance: "Rebalance",
+  harvest:   "Harvest",
+  close:     "Close",
+};
+const EVENT_ICONS: Record<PositionEventKind, string> = {
+  open:      "⊕",
+  rebalance: "⇄",
+  harvest:   "✦",
+  close:     "⊗",
+};
+
+function renderPositionTimeline() {
+  const wrap = document.getElementById("position-timeline");
+  if (!wrap) return;
+  const events = getPositionEvents(selectedAsset.id, selectedPool.id);
+  if (events.length === 0) {
+    wrap.style.display = "none";
+    return;
+  }
+  wrap.style.display = "";
+  const list = document.getElementById("position-timeline-list")!;
+  list.innerHTML = events.map(ev => {
+    const d = new Date(ev.timestamp);
+    const localStr = d.toLocaleString(undefined, { dateStyle: "short", timeStyle: "short" });
+    const utcStr   = d.toUTCString();
+    const hfStr    = ev.hf !== null ? ` · HF ${fmt(ev.hf, 3)}` : "";
+    const shortHash = ev.hash.slice(0, 8) + "…" + ev.hash.slice(-4);
+    return `<div class="pos-event-item pos-event-${ev.kind}">
+      <span class="pos-event-icon" aria-hidden="true">${EVENT_ICONS[ev.kind]}</span>
+      <span class="pos-event-label">${EVENT_LABELS[ev.kind]}</span>
+      <time class="pos-event-time" title="${utcStr}" datetime="${d.toISOString()}">${localStr}</time>
+      <span class="pos-event-hf">${hfStr}</span>
+      <a class="pos-event-link" href="${explorerTxUrl(ev.hash)}" target="_blank" rel="noopener">${shortHash}</a>
+    </div>`;
+  }).join("");
+}
+
+async function refreshTimelineFromChain() {
+  const events = await fetchPositionEvents(selectedPool, userAddress!, selectedAsset.id);
+  if (events.length === 0) return;
+  const stored = getPositionEvents(selectedAsset.id, selectedPool.id);
+  const storedHashes = new Set(stored.map(e => e.hash));
+  let changed = false;
+  for (const ev of events) {
+    if (!storedHashes.has(ev.hash)) {
+      stored.push(ev);
+      changed = true;
+    }
+  }
+  if (changed) {
+    stored.sort((a, b) => b.timestamp - a.timestamp);
+    savePositionEvents(selectedAsset.id, selectedPool.id, stored);
+    renderPositionTimeline();
+  }
 }
 
 // ── TX Stepper (#10) ─────────────────────────────────────────────────────────
@@ -1040,6 +1131,8 @@ function renderPosition() {
 
   // Compound row: show swap estimate if there's pending BLND
   updateCompoundEstimate();
+  // Position event timeline (A25)
+  renderPositionTimeline();
 }
 
 async function updateCompoundEstimate() {
@@ -1335,6 +1428,10 @@ async function loadAll() {
 
     renderSelectedAsset();
     startFreshnessTimer();
+    // Refresh timeline from chain in background (A25)
+    if (positions.byAsset.has(selectedAsset.id)) {
+      refreshTimelineFromChain().catch(() => {});
+    }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     console.error("Failed to load pool data:", e);
@@ -1375,9 +1472,10 @@ async function openPosition() {
     const approveXdr = await buildApproveXdr(selectedPool, userAddress, liveAsset.id, initialStroops + 1n);
     await signAndSubmit(approveXdr, `Approve ${liveAsset.symbol}`, 0);
     const submitXdr = await buildOpenPositionXdr(selectedPool, userAddress, liveAsset, initialStroops, leverage);
-    await signAndSubmit(submitXdr, `Open ${liveAsset.symbol} leverage`, 1);
+    const openHash = await signAndSubmit(submitXdr, `Open ${liveAsset.symbol} leverage`, 1);
     hideTxStepper();
     savePnlEntry(liveAsset.id, selectedPool.id, initial);
+    recordPositionEvent("open", openHash, hfForLeverage(leverage, liveAsset.cFactor, rs?.lFactor ?? 1));
     await loadAll();
   } catch (e: any) {
     markStepperError(2);
@@ -1403,8 +1501,9 @@ async function closePosition() {
   showTxStepper(["Close Position"]);
   try {
     const submitXdr = await buildCloseSubmitXdr(selectedPool, userAddress, pos);
-    await signAndSubmit(submitXdr, `Close ${selectedAsset.symbol} position`, 0);
+    const closeHash = await signAndSubmit(submitXdr, `Close ${selectedAsset.symbol} position`, 0);
     hideTxStepper();
+    recordPositionEvent("close", closeHash, null);
     removePnlEntry(selectedAsset.id, selectedPool.id);
     await loadAll();
   } catch (e: any) {
@@ -1494,8 +1593,9 @@ async function claimBlnd() {
   showTxStepper(["Claim BLND"]);
   try {
     const claimXdr = await buildClaimXdr(selectedPool, userAddress, tokenIds);
-    await signAndSubmit(claimXdr, "Claim BLND", 0);
+    const claimHash = await signAndSubmit(claimXdr, "Claim BLND", 0);
     hideTxStepper();
+    recordPositionEvent("harvest", claimHash, null);
     await loadAll();
   } catch (e: any) {
     markStepperError(1);
@@ -1530,10 +1630,12 @@ async function adjustLeverage() {
   try {
     if (targetLev > curLev) {
       const xdr = await buildIncreaseLeverageXdr(selectedPool, userAddress, liveAsset, pos, targetLev);
-      await signAndSubmit(xdr, `Increase leverage to ${targetLev.toFixed(1)}\u00D7`, 0);
+      const h = await signAndSubmit(xdr, `Increase leverage to ${targetLev.toFixed(1)}\u00D7`, 0);
+      recordPositionEvent("rebalance", h, hfForLeverage(targetLev, liveAsset.cFactor, rs?.lFactor ?? 1));
     } else {
       const xdr = await buildDecreaseLeverageXdr(selectedPool, userAddress, liveAsset, pos, targetLev);
-      await signAndSubmit(xdr, `Decrease leverage to ${targetLev.toFixed(1)}\u00D7`, 0);
+      const h = await signAndSubmit(xdr, `Decrease leverage to ${targetLev.toFixed(1)}\u00D7`, 0);
+      recordPositionEvent("rebalance", h, hfForLeverage(targetLev, liveAsset.cFactor, rs?.lFactor ?? 1));
     }
     hideTxStepper();
     await loadAll();
@@ -1650,7 +1752,8 @@ async function claimAndConvert() {
   try {
     // Claim
     const claimXdr = await buildClaimXdr(selectedPool, userAddress, tokenIds);
-    await signAndSubmit(claimXdr, "Claim BLND", 0);
+    const claimHash = await signAndSubmit(claimXdr, "Claim BLND", 0);
+    recordPositionEvent("harvest", claimHash, null);
 
     // Check actual BLND balance after claim
     const blndBalance = await fetchAssetBalance(userAddress, getBlndId());
