@@ -11,7 +11,7 @@
  */
 
 import { POOLS, LEVERAGE_BRACKETS, POOL_NAMES, fetchReserveRates, computeNetApy, type ReserveRates } from "./stellar.ts";
-import { sendVerificationEmail, sendApyAlert } from "./email.ts";
+import { notify, sendVerification, type ChannelType } from "./notify.ts";
 
 interface Env {
   DB: D1Database;
@@ -48,6 +48,8 @@ function corsHeaders(env: Env): Record<string, string> {
 }
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const WEBHOOK_RE = /^https:\/\/(hooks\.slack\.com|discord\.com\/api\/webhooks)\//;
+const VALID_CHANNELS = new Set<ChannelType>(["email", "slack", "discord"]);
 
 /** Known pool IDs for validation. */
 const KNOWN_POOL_IDS = new Set(POOLS.flatMap(p => [p.id]));
@@ -78,12 +80,27 @@ async function handleSubscribe(request: Request, env: Env): Promise<Response> {
     return jsonResponse({ ok: false, error: "Invalid JSON" }, 400, env);
   }
 
-  const { email, pool_id, asset_symbol, leverage_bracket } = body;
+  const { channel_type = "email", email, webhook_url, pool_id, asset_symbol, leverage_bracket } = body;
 
-  // Validate
-  if (!email || !EMAIL_RE.test(email)) {
-    return jsonResponse({ ok: false, error: "Invalid email" }, 400, env);
+  // Validate channel
+  if (!VALID_CHANNELS.has(channel_type)) {
+    return jsonResponse({ ok: false, error: "channel_type must be email, slack, or discord" }, 400, env);
   }
+
+  // Resolve destination
+  let destination: string;
+  if (channel_type === "email") {
+    if (!email || !EMAIL_RE.test(email)) {
+      return jsonResponse({ ok: false, error: "Invalid email" }, 400, env);
+    }
+    destination = email;
+  } else {
+    if (!webhook_url || !WEBHOOK_RE.test(webhook_url)) {
+      return jsonResponse({ ok: false, error: `webhook_url must start with the official ${channel_type} webhook base URL` }, 400, env);
+    }
+    destination = webhook_url;
+  }
+
   if (!KNOWN_POOL_IDS.has(pool_id)) {
     return jsonResponse({ ok: false, error: "Unknown pool" }, 400, env);
   }
@@ -100,32 +117,36 @@ async function handleSubscribe(request: Request, env: Env): Promise<Response> {
 
   try {
     await env.DB.prepare(`
-      INSERT INTO subscriptions (email, pool_id, asset_symbol, leverage_bracket, verify_token, unsub_token)
-      VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-      ON CONFLICT(email, pool_id, asset_symbol, leverage_bracket) DO UPDATE
-        SET verify_token = ?5, unsub_token = ?6, verified = 0
-    `).bind(email, pool_id, asset_symbol, lev, verifyToken, unsubToken).run();
+      INSERT INTO subscriptions (channel_type, destination, pool_id, asset_symbol, leverage_bracket, verify_token, unsub_token)
+      VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+      ON CONFLICT(destination, pool_id, asset_symbol, leverage_bracket) DO UPDATE
+        SET channel_type = ?1, verify_token = ?6, unsub_token = ?7, verified = 0
+    `).bind(channel_type, destination, pool_id, asset_symbol, lev, verifyToken, unsubToken).run();
   } catch (e: any) {
     console.error("DB insert failed:", e);
     return jsonResponse({ ok: false, error: "Database error" }, 500, env);
   }
 
-  // Send verification email
   const base = workerUrl(request);
   const verifyUrl = `${base}/verify?token=${verifyToken}`;
 
-  const result = await sendVerificationEmail(
+  const result = await sendVerification(
     { RESEND_API_KEY: env.RESEND_API_KEY, RESEND_FROM: env.RESEND_FROM },
-    email,
+    channel_type,
+    destination,
     verifyUrl,
   );
 
   if (!result.ok) {
-    console.error("Failed to send verification email:", result.error);
-    return jsonResponse({ ok: false, error: "Failed to send verification email" }, 500, env);
+    console.error("Failed to send verification:", result.error);
+    return jsonResponse({ ok: false, error: "Failed to send verification" }, 500, env);
   }
 
-  return jsonResponse({ ok: true, message: "Check your email to verify your subscription." }, 200, env);
+  const channelMsg = channel_type === "email"
+    ? "Check your email to verify your subscription."
+    : `Check your ${channel_type} channel to verify your subscription.`;
+
+  return jsonResponse({ ok: true, message: channelMsg }, 200, env);
 }
 
 async function handleVerify(request: Request, env: Env): Promise<Response> {
@@ -209,7 +230,7 @@ async function handleCron(env: Env): Promise<void> {
 
         // Find verified subscribers who haven't been alerted in the last 24h
         const subs = await env.DB.prepare(`
-          SELECT id, email, unsub_token
+          SELECT id, channel_type, destination, unsub_token
           FROM subscriptions
           WHERE pool_id = ?1
             AND asset_symbol = ?2
@@ -224,9 +245,13 @@ async function handleCron(env: Env): Promise<void> {
 
         for (const sub of subs.results) {
           const unsubUrl = `https://turbolong-alerts.workers.dev/unsubscribe?token=${sub.unsub_token}`;
-          const result = await sendApyAlert(
+          const result = await notify(
             { RESEND_API_KEY: env.RESEND_API_KEY, RESEND_FROM: env.RESEND_FROM },
-            sub.email as string,
+            {
+              channel_type: sub.channel_type as ChannelType,
+              destination: sub.destination as string,
+              unsub_token: sub.unsub_token as string,
+            },
             {
               poolName: pool.name,
               assetSymbol: asset.symbol,
@@ -244,7 +269,7 @@ async function handleCron(env: Env): Promise<void> {
               "UPDATE subscriptions SET last_alerted_at = datetime('now') WHERE id = ?1"
             ).bind(sub.id).run();
           } else {
-            console.error(`[cron] Failed to send alert to ${sub.email}:`, result.error);
+            console.error(`[cron] Failed to send alert to ${sub.destination}:`, result.error);
           }
         }
       }
