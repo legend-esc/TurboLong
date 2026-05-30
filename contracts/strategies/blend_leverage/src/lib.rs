@@ -49,6 +49,7 @@ impl DeFindexStrategyTrait for BlendLeverageStrategy {
     ///   [5] c_factor: i128         — collateral factor (1e7)
     ///   [6] target_loops: u32      — number of leverage loops
     ///   [7] min_hf: i128           — minimum health factor (1e7)
+    ///   [8] orange_hf: i128        — orange-zone threshold (1e7, must be > min_hf)
     fn __constructor(e: Env, asset: Address, init_args: Vec<Val>) {
         let pool: Address = init_args
             .get(0)
@@ -82,6 +83,10 @@ impl DeFindexStrategyTrait for BlendLeverageStrategy {
             .get(7)
             .expect("Missing: min_hf")
             .into_val(&e);
+        let orange_hf: i128 = init_args
+            .get(8)
+            .expect("Missing: orange_hf")
+            .into_val(&e);
 
         // Look up the reserve index from the pool
         let pool_client = blend_contract_sdk::pool::Client::new(&e, &pool);
@@ -107,6 +112,7 @@ impl DeFindexStrategyTrait for BlendLeverageStrategy {
             c_factor,
             target_loops,
             min_hf,
+            orange_hf,
         };
 
         storage::set_config(&e, config);
@@ -301,7 +307,8 @@ impl DeFindexStrategyTrait for BlendLeverageStrategy {
 
 #[contractimpl]
 impl BlendLeverageStrategy {
-    /// Rebalance: auto-deleverage if health factor is below min_hf.
+    /// Rebalance: partial-unwind if HF is in the orange zone (orange_hf > HF >= min_hf boundary).
+    /// Unwinds the minimum number of loops to restore min_hf.
     /// Callable by anyone (permissionless — protects the vault).
     pub fn rebalance(e: Env) -> Result<(), StrategyError> {
         extend_instance_ttl(&e);
@@ -316,11 +323,12 @@ impl BlendLeverageStrategy {
 
         let hf = compute_health_factor(b_tokens, d_tokens, b_rate, d_rate, config.c_factor)?;
 
-        if hf >= config.min_hf {
-            return Ok(()); // HF is healthy
+        // Only act if HF is in the orange zone (below orange_hf threshold)
+        if hf >= config.orange_hf {
+            return Ok(());
         }
 
-        // Compute how many loops to unwind
+        // Compute minimum loops to restore min_hf
         let unwind_count = compute_unwind_loops(
             b_tokens, d_tokens, b_rate, d_rate, config.c_factor, config.min_hf,
         )?;
@@ -329,14 +337,54 @@ impl BlendLeverageStrategy {
             return Ok(());
         }
 
-        // Execute deleverage
         let (b_removed, d_removed) =
             blend_pool::submit_deleverage(&e, unwind_count, &config)?;
 
-        // Update reserves accounting
         reserves::deleverage(&e, b_removed, d_removed, &config)?;
 
         Ok(())
+    }
+
+    /// Partial-unwind liquidation protection: keeper- or user-triggered.
+    ///
+    /// If HF is below `orange_hf`, unwinds the minimum number of loops to
+    /// bring HF back to `min_hf`. No-ops if HF is already at or above `orange_hf`.
+    ///
+    /// Returns the number of loops unwound.
+    pub fn partial_unwind(e: Env, caller: Address) -> Result<u32, StrategyError> {
+        extend_instance_ttl(&e);
+
+        // Keeper or any user may call this (permissionless protection)
+        caller.require_auth();
+
+        let config = storage::get_config(&e);
+        let (b_rate, d_rate) = blend_pool::get_rates(&e, &config);
+        let (b_tokens, d_tokens) = blend_pool::get_strategy_positions(&e, &config);
+
+        if d_tokens == 0 {
+            return Ok(0);
+        }
+
+        let hf = compute_health_factor(b_tokens, d_tokens, b_rate, d_rate, config.c_factor)?;
+
+        if hf >= config.orange_hf {
+            return Ok(0); // Not in orange zone
+        }
+
+        let unwind_count = compute_unwind_loops(
+            b_tokens, d_tokens, b_rate, d_rate, config.c_factor, config.min_hf,
+        )?;
+
+        if unwind_count == 0 {
+            return Ok(0);
+        }
+
+        let (b_removed, d_removed) =
+            blend_pool::submit_deleverage(&e, unwind_count, &config)?;
+
+        reserves::deleverage(&e, b_removed, d_removed, &config)?;
+
+        Ok(unwind_count)
     }
 
     /// Set a new keeper address. Only the current keeper can call this.

@@ -315,6 +315,20 @@ fn test_hf_below_one() {
 // ── compute_unwind_loops ─────────────────────────────────────────────────────
 
 #[test]
+fn test_unwind_already_at_target_returns_zero() {
+    // HF = 1.9 >> 1.05 → already healthy, no unwinding needed
+    let loops = compute_unwind_loops(
+        2_000_0000000,
+        1_000_0000000,
+        SCALAR_12,
+        SCALAR_12,
+        9_500_000,
+        10_500_000, // target_hf = 1.05
+    ).unwrap();
+    assert_eq!(loops, 0);
+}
+
+#[test]
 fn test_unwind_healthy_position_returns_zero() {
     // HF = 1.9 >> 1.05 → no unwinding needed
     let loops = compute_unwind_loops(
@@ -342,7 +356,7 @@ fn test_unwind_unhealthy_position() {
         10_500_000,
     ).unwrap();
     assert!(loops > 0, "Should need at least 1 unwind loop");
-    assert!(loops <= 5, "Should not exceed safety limit");
+    assert!(loops <= 20, "Should not exceed safety cap");
 }
 
 #[test]
@@ -356,6 +370,95 @@ fn test_unwind_no_debt() {
         10_500_000,
     ).unwrap();
     assert_eq!(loops, 0);
+}
+
+#[test]
+fn test_unwind_single_loop_position() {
+    // 1-loop position: b=1950, d=950, c=0.95
+    // HF = 1950 * 0.95 / 950 = 1852.5 / 950 ≈ 1.95 → healthy
+    let loops = compute_unwind_loops(
+        1_950_0000000,
+        950_0000000,
+        SCALAR_12,
+        SCALAR_12,
+        9_500_000,
+        10_500_000,
+    ).unwrap();
+    assert_eq!(loops, 0, "Single-loop healthy position needs no unwind");
+
+    // Now make it unhealthy: b=1000, d=950 → HF = 1000*0.95/950 ≈ 1.0 < 1.05
+    let loops = compute_unwind_loops(
+        1_000_0000000,
+        950_0000000,
+        SCALAR_12,
+        SCALAR_12,
+        9_500_000,
+        10_500_000,
+    ).unwrap();
+    assert!(loops > 0, "Single-loop unhealthy position needs unwind");
+}
+
+#[test]
+fn test_unwind_max_loops_position() {
+    // 20-loop position deeply underwater: b=1000, d=999, c=0.95
+    // HF = 1000*0.95/999 ≈ 0.9509 < 1.05 → needs unwinding
+    let loops = compute_unwind_loops(
+        1_000_0000000,
+        999_0000000,
+        SCALAR_12,
+        SCALAR_12,
+        9_500_000,
+        10_500_000,
+    ).unwrap();
+    assert!(loops > 0, "Deeply leveraged position needs unwind");
+    assert!(loops <= 20, "Should not exceed safety cap of 20");
+}
+
+#[test]
+fn test_unwind_result_achieves_target_hf() {
+    // Verify that after simulating `loops` unwind steps, HF >= target_hf
+    let b = 10_499_0000000_i128;
+    let d = 9_500_0000000_i128;
+    let c = 9_500_000_i128;
+    let target = 10_500_000_i128;
+
+    let loops = compute_unwind_loops(b, d, SCALAR_12, SCALAR_12, c, target).unwrap();
+
+    // Simulate the same steps
+    let mut cb = b;
+    let mut cd = d;
+    for _ in 0..loops {
+        let layer = cd * (SCALAR_7 - c) / SCALAR_7;
+        cb -= layer;
+        cd -= layer;
+    }
+    let final_hf = compute_health_factor(cb, cd, SCALAR_12, SCALAR_12, c).unwrap();
+    assert!(final_hf >= target,
+        "After {} loops, HF={} should be >= target={}", loops, final_hf, target);
+}
+
+#[test]
+fn test_unwind_is_minimal() {
+    // Verify that one fewer loop would NOT achieve target_hf
+    let b = 10_499_0000000_i128;
+    let d = 9_500_0000000_i128;
+    let c = 9_500_000_i128;
+    let target = 10_500_000_i128;
+
+    let loops = compute_unwind_loops(b, d, SCALAR_12, SCALAR_12, c, target).unwrap();
+
+    if loops > 0 {
+        let mut cb = b;
+        let mut cd = d;
+        for _ in 0..(loops - 1) {
+            let layer = cd * (SCALAR_7 - c) / SCALAR_7;
+            cb -= layer;
+            cd -= layer;
+        }
+        let hf_before_last = compute_health_factor(cb, cd, SCALAR_12, SCALAR_12, c).unwrap();
+        assert!(hf_before_last < target,
+            "One fewer loop ({}) should NOT achieve target: HF={}", loops - 1, hf_before_last);
+    }
 }
 
 // ── Leverage table validation (cross-reference with simulate.rs) ─────────────
@@ -642,6 +745,7 @@ fn test_safety_rejects_high_utilization() {
         c_factor: 9_500_000,
         target_loops: 8,
         min_hf: 10_500_000,
+        orange_hf: 11_500_000,
     };
 
     // Pool at 96% utilization → should panic (above 95% limit)
@@ -677,6 +781,7 @@ fn test_safety_allows_healthy_pool() {
         c_factor: 9_500_000,
         target_loops: 8,
         min_hf: 10_500_000,
+        orange_hf: 11_500_000,
     };
 
     // Pool at 50% utilization, healthy HF

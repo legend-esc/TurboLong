@@ -148,6 +148,7 @@ fn make_config(e: &Env, pool_addr: &Address, token: &Address, blnd: &Address) ->
         c_factor: 9_000_000, // 0.90: below pool's c=0.95 to keep HF > 1.0
         target_loops: 3,
         min_hf: 10_500_000,
+        orange_hf: 11_500_000,
     }
 }
 
